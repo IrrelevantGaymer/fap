@@ -1,3 +1,6 @@
+# fap
+A terminal based file explorer that uses vim motions to avoid using a mouse.  Can be used as a replacement for cd alongside adding a bash script.
+
 If your terminal is bash, in your .bashrc file add:
 
 ```
