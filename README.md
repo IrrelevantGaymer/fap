@@ -1,9 +1,11 @@
 If your terminal is bash, in your .bashrc file add:
 
+```
 fap() {
     local result=$(/home/river/Desktop/Projects/File_Access_Pathfinder/fap/target/release/fap "$@")
     [ -n "$result" ] && cd -- "$result"
 }
+```
 
 This will allow you to type fap in your terminal, opening fap and allowing you to change your cd to the cd you went to in the fap instance.
 
