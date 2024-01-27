@@ -18,6 +18,8 @@ mod panic_guard;
 
 use panic_guard::GuardWithHook;
 
+use crate::app::LEFT_SIDE_PADDING;
+
 const BOTTOM_RESERVED: u16 = 3;
 const START_X: u16 = 0;
 const START_Y: u16 = 3;
@@ -44,7 +46,7 @@ fn main() -> io::Result<()> {
             io::stderr().flush()?;
             app.generate_buffer();
             app.draw_screen()?;
-            execute!(io::stderr(), MoveTo(START_X, START_Y))?;
+            execute!(io::stderr(), MoveTo(LEFT_SIDE_PADDING + START_X, START_Y))?;
             app.read_input()?;
         }
     }
@@ -63,42 +65,49 @@ fn writeln_to_screen(msg: String) -> io::Result<()> {
     return Ok(());
 }
 
-pub struct Position(u16, u16);
+pub struct Position {
+    pub x: u16,
+    pub y: u16
+}
 
 impl Position {
+    pub fn new(x: u16, y: u16) -> Position {
+        Position {x, y}
+    }
+    
     pub fn get(&self) -> (u16, u16) {
-        (self.0, self.1)
+        (self.x, self.y)
     }
 
     pub fn move_left(&mut self) {
-        self.0 -= 1;
+        self.x -= 1;
     }
 
     pub fn move_up(&mut self) {
-        self.1 -= 1;
+        self.y -= 1;
     }
 
     pub fn move_down(&mut self) {
-        self.1 += 1;
+        self.y += 1;
     }
 
     pub fn move_right(&mut self) {
-        self.0 += 1;
+        self.x += 1;
     }
 
     pub fn set_col(&mut self, col: u16) {
-        self.0 = col;
+        self.x = col;
     }
 
     pub fn set_row(&mut self, row: u16) {
-        self.1 = row;
+        self.y = row;
     }
 
     pub fn col(&self) -> u16 {
-        self.0
+        self.x
     }
 
     pub fn row(&self) -> u16 {
-        self.1
+        self.y
     }
 }

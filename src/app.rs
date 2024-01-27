@@ -1,14 +1,10 @@
 use std::{
-    io::{self, ErrorKind}, 
-    path::{Path, PathBuf}, 
-    cmp::{max, min}, 
-    fs::DirEntry, process::Stdio,
-    fmt::Display
+    cmp::{max, min}, fmt::Display, fs::DirEntry, io::{self, ErrorKind}, path::{Path, PathBuf}, process::Stdio
 };
 
 use crossterm::{
     cursor::{MoveDown, MoveLeft, MoveRight, MoveTo, MoveToColumn, MoveToRow, MoveUp, RestorePosition, SavePosition},
-    event::{read, Event, KeyCode, KeyEvent},
+    event::{read, Event, KeyCode, KeyEvent, KeyModifiers},
     terminal::{
         self, Clear, ClearType, SetSize
     },
@@ -19,6 +15,8 @@ use path_absolutize::Absolutize;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{BOTTOM_RESERVED, START_X, START_Y, Position, write_to_screen, writeln_to_screen};
+
+pub const LEFT_SIDE_PADDING: u16 = 4;
 
 pub struct App {
     pub buffer: Vec<(Option<PathBuf>, usize, String)>,
@@ -110,16 +108,20 @@ impl App {
     }
 
     pub fn draw_screen(&self) -> io::Result<()> {
-        
+        let (_col, row) = self.cursor_position.get();
         execute!(io::stderr(), Clear(ClearType::All), MoveTo(0, 0))?;
     
         let rows = terminal::window_size()?.rows;
     
-        for i in 0..rows-BOTTOM_RESERVED {
-            if i as usize >= self.buffer.len() {
-                break;
+        for i in 0..(rows - BOTTOM_RESERVED) {
+            if self.index + i >= self.buffer.len() as u16 {
+                writeln_to_screen(format!("~"))?;
+                continue;
             }
+            
             let (_, _, display) = &self.buffer[(self.index + i) as usize];
+            let distance = (row as i16 - i as i16).abs() as u16;
+            write_to_screen(format!("{distance:>3} "))?;
             writeln_to_screen(format!("{}", display))?;
         }
     
@@ -133,12 +135,14 @@ impl App {
     
         let (_, len, _) = &self.buffer[(self.index + self.cursor_position.row()) as usize];
         
-        execute!(io::stderr(), MoveToColumn(0), MoveToRow(rows - BOTTOM_RESERVED))?;
+        execute!(io::stderr(), MoveTo(0, rows - BOTTOM_RESERVED))?;
         writeln_to_screen(format!("{empty:=<24}", empty = ""))?;
         writeln_to_screen(format!(
-            "x: {}, y: {}. cur item len: {} {empty: <8}", 
+            "index: {}, x: {}, y: {}. items: {}, cur item len: {} {empty: <8}", 
+            self.index,
             self.cursor_position.col(), 
             self.cursor_position.row(), 
+            self.buffer.len(),
             len,
             empty = ""
         ))?;
@@ -148,8 +152,8 @@ impl App {
     }
 
     pub fn read_input(&mut self) -> io::Result<()> {
-        self.cursor_position = Position(START_X, START_Y);
-        self.stored_position = Position(START_X, START_Y);
+        self.cursor_position = Position::new(START_X, START_Y);
+        self.stored_position = Position::new(START_X, START_Y);
         loop {
             match read()? {
                 Event::Key(KeyEvent{code: KeyCode::Char(n), ..}) if n.is_digit(10) => {
@@ -168,6 +172,60 @@ impl App {
                     } else {
                         self.command_state.prefix = Prefix::g;
                     }
+                },
+                Event::Key(KeyEvent{
+                    code: KeyCode::Char('e'), 
+                    modifiers: KeyModifiers::CONTROL, ..
+                }) => {
+                    self.loop_fn(
+                        |s| s.move_screen_down_line()
+                    )?;
+                    self.command_state.prefix = Prefix::None;
+                },
+                Event::Key(KeyEvent{
+                    code: KeyCode::Char('y'), 
+                    modifiers: KeyModifiers::CONTROL, ..
+                }) => {
+                    self.loop_fn(
+                        |s| s.move_screen_up_line()
+                    )?;
+                    self.command_state.prefix = Prefix::None;
+                },
+                Event::Key(KeyEvent{
+                    code: KeyCode::Char('f'), 
+                    modifiers: KeyModifiers::CONTROL, ..
+                }) => {
+                    self.loop_fn(
+                        |s| s.move_screen_down_page()
+                    )?;
+                    self.command_state.prefix = Prefix::None;
+                },
+                Event::Key(KeyEvent{
+                    code: KeyCode::Char('b'), 
+                    modifiers: KeyModifiers::CONTROL, ..
+                }) => {
+                    self.loop_fn(
+                        |s| s.move_screen_up_page()
+                    )?;
+                    self.command_state.prefix = Prefix::None;
+                },
+                Event::Key(KeyEvent{
+                    code: KeyCode::Char('d'), 
+                    modifiers: KeyModifiers::CONTROL, ..
+                }) => {
+                    self.loop_fn(
+                        |s| s.move_down_half_page()
+                    )?;
+                    self.command_state.prefix = Prefix::None;
+                },
+                Event::Key(KeyEvent{
+                    code: KeyCode::Char('u'), 
+                    modifiers: KeyModifiers::CONTROL, ..
+                }) => {
+                    self.loop_fn(
+                        |s| s.move_up_half_page()
+                    )?;
+                    self.command_state.prefix = Prefix::None;
                 },
                 Event::Key(KeyEvent{code: KeyCode::Char('G'), ..}) => {
                     self.move_cursor_to_last_line()?;
@@ -209,6 +267,9 @@ impl App {
                     )?;
                     self.command_state.prefix = Prefix::None;
                 },
+                Event::Key(KeyEvent{code: KeyCode::Char('-'), ..}) => {
+                    self.go_to_parent_dir()?;
+                },
                 Event::Key(KeyEvent{code: KeyCode::Char(' '), ..}) => {
                     self.output = self.cd.to_str().ok_or(
                         io::Error::new(ErrorKind::InvalidData, "cannot parse cd")
@@ -236,13 +297,33 @@ impl App {
         return Ok(());
     }
 
-    pub fn loop_fn(&mut self, fun: fn(&mut Self) -> io::Result<()>) -> io::Result<()> {
+    pub fn loop_fn(
+        &mut self, 
+        fun: fn(&mut Self) -> io::Result<()>
+    ) -> io::Result<()> {
         let times = self.command_state.number.unwrap_or(1);
         for _ in 0..times {
             fun(self)?;
         }
         self.command_state.number = None;
 
+        return Ok(());
+    }
+
+    pub fn go_to_parent_dir(&mut self) -> io::Result<()> {
+        if let Some(root) = self.cd.parent() {
+            self.cd = root.to_path_buf();
+            self.generate_buffer();
+            execute!(io::stderr(), 
+                Clear(ClearType::All), 
+                MoveTo(LEFT_SIDE_PADDING,0)
+            )?;
+            self.index = 0;
+            self.cursor_position = Position::new(START_X, START_Y);
+            self.draw_screen()?;
+            execute!(io::stderr(), MoveTo(LEFT_SIDE_PADDING + START_X, START_Y))?;
+            self.stored_position = Position::new(START_X, START_Y);
+        }
         return Ok(());
     }
     
@@ -258,11 +339,11 @@ impl App {
         self.cursor_position.set_row(0);
     
         if max_col < col {
-            execute!(io::stderr(), MoveToColumn(max_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + max_col))?;
             self.cursor_position.set_col(max_col);
         } else if col < min(self.stored_position.col(), max_col) {
             let new_col = min(self.stored_position.col(), max_col);
-            execute!(io::stderr(), MoveToColumn(new_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + new_col))?;
             self.cursor_position.set_col(new_col);
         }
         execute!(io::stderr(), SavePosition)?;
@@ -291,11 +372,11 @@ impl App {
         self.cursor_position.set_row(self.stored_position.row());
     
         if max_col < col {
-            execute!(io::stderr(), MoveToColumn(max_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + max_col))?;
             self.cursor_position.set_col(max_col);
         } else if col < min(self.stored_position.col(), max_col) {
             let new_col = min(self.stored_position.col(), max_col);
-            execute!(io::stderr(), MoveToColumn(new_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + new_col))?;
             self.cursor_position.set_col(new_col);
         }
         execute!(io::stderr(), SavePosition)?;
@@ -304,7 +385,150 @@ impl App {
     
         return Ok(());
     }
+
+    pub fn move_screen_down_line(&mut self) -> io::Result<()> {
+        let (_col, row) = self.cursor_position.get();
+        let height = terminal::window_size()?.rows - BOTTOM_RESERVED - 1;
+
+        if self.buffer.len() as u16 <= height || self.index >= self.buffer.len() as u16 - 1 {
+            return Ok(());
+        }
+
+        self.index += 1;
+
+        if self.index + row == self.buffer.len() as u16 {
+            execute!(io::stderr(), MoveUp(1))?;
+            self.cursor_position.move_up();
+            self.stored_position.move_up();
+        }
+
+        execute!(io::stderr(), SavePosition)?;
+        self.draw_screen()?;
+        execute!(io::stderr(), RestorePosition)?;
+
+        return Ok(());
+    }
     
+    pub fn move_screen_up_line(&mut self) -> io::Result<()> {
+        let height = terminal::window_size()?.rows - BOTTOM_RESERVED - 1;
+
+        if self.buffer.len() as u16 <= height || self.index == 0 {
+            return Ok(());
+        }
+
+        self.index -= 1;
+
+        execute!(io::stderr(), SavePosition)?;
+        self.draw_screen()?;
+        execute!(io::stderr(), RestorePosition)?;
+
+        return Ok(());
+    }
+
+    pub fn move_screen_down_page(&mut self) -> io::Result<()> {
+        let height = terminal::window_size()?.rows - BOTTOM_RESERVED - 1;
+        const PAGE_GAP: u16 = 2;
+        
+        self.index = if self.index + height - PAGE_GAP > (self.buffer.len() - 1) as u16 {
+            (self.buffer.len() - 1) as u16
+        } else {
+            self.index + height - PAGE_GAP
+        };
+        
+        execute!(io::stderr(), MoveToRow(0))?;
+        self.cursor_position.set_row(0);
+        self.stored_position.set_row(0);
+
+        execute!(io::stderr(), SavePosition)?;
+        self.draw_screen()?;
+        execute!(io::stderr(), RestorePosition)?;
+
+        return Ok(());
+    }
+
+    pub fn move_screen_up_page(&mut self) -> io::Result<()> {
+        let height = terminal::window_size()?.rows - BOTTOM_RESERVED - 1;
+        const PAGE_GAP: u16 = 2;
+
+        self.index = if self.index < height - PAGE_GAP {
+            0
+        } else {
+            self.index + PAGE_GAP - height 
+        };
+
+        let row = min(
+            self.buffer.len() as u16 - self.index - 1, 
+            height
+        );
+        
+        execute!(io::stderr(), MoveToRow(row))?;
+        self.cursor_position.set_row(row);
+        self.stored_position.set_row(row);
+
+        execute!(io::stderr(), SavePosition)?;
+        self.draw_screen()?;
+        execute!(io::stderr(), RestorePosition)?;
+        
+        return Ok(());
+    }
+
+    pub fn move_down_half_page(&mut self) -> io::Result<()> {
+        let (_col, mut row) = self.cursor_position.get();
+        let height = terminal::window_size()?.rows - BOTTOM_RESERVED - 1;
+        
+        self.index = if 
+            ((self.buffer.len() - 1) as u16) <= height 
+            || self.index == self.buffer.len() as u16 - height - 1 
+        {
+            row = *[
+                self.buffer.len() as u16 - self.index - 1,
+                height,
+                row + height / 2 + 1, 
+            ].iter().min().unwrap_or(&row);
+
+            execute!(io::stderr(), MoveToRow(row))?;
+            self.cursor_position.set_row(row);
+            self.stored_position.set_row(row);
+
+            self.index
+        } else if self.index + height / 2 + 1 > self.buffer.len() as u16 - height - 1 {
+            self.buffer.len() as u16 - height - 1
+        } else {
+            self.index + height / 2 + 1
+        };
+
+        execute!(io::stderr(), SavePosition)?;
+        self.draw_screen()?;
+        execute!(io::stderr(), RestorePosition)?;
+
+        return Ok(());
+    }
+
+    pub fn move_up_half_page(&mut self) -> io::Result<()> {
+        let (_col, mut row) = self.cursor_position.get();
+        let height = terminal::window_size()?.rows - BOTTOM_RESERVED - 1;
+        
+        self.index = if self.index == 0 {
+            row -= min(row, height / 2 + 1);
+
+            execute!(io::stderr(), MoveToRow(row))?;
+            self.cursor_position.set_row(row);
+            self.stored_position.set_row(row);
+
+            self.index
+        } else if self.index < height / 2 + 1 {
+            0
+        } else {
+            self.index - height / 2 - 1
+        };
+
+        execute!(io::stderr(), SavePosition)?;
+        self.draw_screen()?;
+        execute!(io::stderr(), RestorePosition)?;
+
+        return Ok(());
+    }
+
     pub fn move_cursor_to_top(&mut self) -> io::Result<()> {
         let (col, _) = self.cursor_position.get();
     
@@ -316,15 +540,15 @@ impl App {
         self.cursor_position.set_row(0);
     
         if max_col < col {
-            execute!(io::stderr(), MoveToColumn(max_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + max_col))?;
             self.cursor_position.set_col(max_col);
         } else if col < min(self.stored_position.col(), max_col) {
             let new_col = min(self.stored_position.col(), max_col);
-            execute!(io::stderr(), MoveToColumn(new_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + new_col))?;
             self.cursor_position.set_col(new_col);
         }
         execute!(io::stderr(), SavePosition)?;
-        self.write_bottom()?;
+        self.draw_screen()?;
         execute!(io::stderr(), RestorePosition)?;
         
         return Ok(());
@@ -344,15 +568,15 @@ impl App {
         self.cursor_position.set_row(row);
     
         if max_col < col {
-            execute!(io::stderr(), MoveToColumn(max_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + max_col))?;
             self.cursor_position.set_col(max_col);
         } else if col < min(self.stored_position.col(), max_col) {
             let new_col = min(self.stored_position.col(), max_col);
-            execute!(io::stderr(), MoveToColumn(new_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + new_col))?;
             self.cursor_position.set_col(new_col);
         }
         execute!(io::stderr(), SavePosition)?;
-        self.write_bottom()?;
+        self.draw_screen()?;
         execute!(io::stderr(), RestorePosition)?;
         
         return Ok(());
@@ -372,15 +596,15 @@ impl App {
         self.cursor_position.set_row(row);
     
         if max_col < col {
-            execute!(io::stderr(), MoveToColumn(max_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + max_col))?;
             self.cursor_position.set_col(max_col);
         } else if col < min(self.stored_position.col(), max_col) {
             let new_col = min(self.stored_position.col(), max_col);
-            execute!(io::stderr(), MoveToColumn(new_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + new_col))?;
             self.cursor_position.set_col(new_col);
         }
         execute!(io::stderr(), SavePosition)?;
-        self.write_bottom()?;
+        self.draw_screen()?;
         execute!(io::stderr(), RestorePosition)?;
         
         return Ok(());
@@ -413,26 +637,23 @@ impl App {
     
         if self.stored_position.row() >= rows - BOTTOM_RESERVED - 1 {
             self.index += 1;
-            execute!(io::stderr(), SavePosition)?;
-            self.draw_screen()?;
-            execute!(io::stderr(), RestorePosition)?;
         } else {
             execute!(io::stderr(), MoveDown(1))?;
-            self.stored_position.set_row(self.stored_position.row() + 1);
+            self.stored_position.move_down();
             self.cursor_position.move_down();
         }
     
         if max_col < col {
-            execute!(io::stderr(), MoveToColumn(max_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + max_col))?;
             self.cursor_position.set_col(max_col);
         } else if col < min(self.stored_position.col(), max_col) {
             let new_col = min(self.stored_position.col(), max_col);
-            execute!(io::stderr(), MoveToColumn(new_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + new_col))?;
             self.cursor_position.set_col(new_col);
         }
     
         execute!(io::stderr(), SavePosition)?;
-        self.write_bottom()?;
+        self.draw_screen()?;
         execute!(io::stderr(), RestorePosition)?;
     
         return Ok(());
@@ -448,29 +669,24 @@ impl App {
         let (_, len, _) = self.buffer[(self.index + row - 1) as usize];
         let max_col = max(len - 1, 0) as u16;
         
-        if self.stored_position.row() == 0 {
-            if self.index > 0 {
-                self.index -= 1;
-                execute!(io::stderr(), SavePosition)?;
-                self.draw_screen()?;
-                execute!(io::stderr(), RestorePosition)?;
-            }
+        if self.stored_position.row() == 0 && self.index > 0 {
+            self.index -= 1;
         } else {
             execute!(io::stderr(), MoveUp(1))?;
-            self.stored_position.set_row(self.stored_position.row() - 1);
+            self.stored_position.move_up();
             self.cursor_position.move_up();
         }
     
         if max_col < col {
-            execute!(io::stderr(), MoveToColumn(max_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + max_col))?;
             self.cursor_position.set_col(max_col);
         } else if col < min(self.stored_position.col(), max_col) {
             let new_col = min(self.stored_position.col(), max_col);
-            execute!(io::stderr(), MoveToColumn(new_col))?;
+            execute!(io::stderr(), MoveToColumn(LEFT_SIDE_PADDING + new_col))?;
             self.cursor_position.set_col(new_col);
         }
         execute!(io::stderr(), SavePosition)?;
-        self.write_bottom()?;
+        self.draw_screen()?;
         execute!(io::stderr(), RestorePosition)?;
         
         return Ok(());
@@ -505,13 +721,13 @@ impl App {
             self.generate_buffer();
             execute!(io::stderr(), 
                 Clear(ClearType::All), 
-                MoveTo(0,0)
+                MoveTo(LEFT_SIDE_PADDING,0)
             )?;
-            self.cursor_position = Position(START_X, START_Y);
+            self.index = 0;
+            self.cursor_position = Position::new(START_X, START_Y);
             self.draw_screen()?;
             execute!(io::stderr(), MoveTo(START_X, START_Y))?;
-            self.stored_position = Position(START_X, START_Y);
-            self.index = 0;
+            self.stored_position = Position::new(START_X, START_Y);
         } else {
             if path.ends_with(".desktop") {
     
@@ -555,9 +771,15 @@ impl App {
         let max_col = max(len - 1, 0) as u16;
     
         if max_col < col {
-            execute!(io::stderr(), MoveTo(max_col, self.stored_position.row()))?;
+            execute!(io::stderr(), MoveTo(
+                LEFT_SIDE_PADDING + max_col, 
+                self.stored_position.row()
+            ))?;
         } else if col < min(self.stored_position.col(), max_col) {
-            execute!(io::stderr(), MoveTo(min(self.stored_position.col(), max_col), self.stored_position.row()))?;
+            execute!(io::stderr(), MoveTo(
+                LEFT_SIDE_PADDING + min(self.stored_position.col(), max_col), 
+                self.stored_position.row()
+            ))?;
         }
     
         execute!(io::stderr(), SavePosition)?;
@@ -575,8 +797,8 @@ impl Default for App {
             cd: std::env::current_dir().unwrap(), 
             output: String::new(), 
             index: 0, 
-            stored_position: Position(START_X, START_Y), 
-            cursor_position: Position(START_X, START_Y), 
+            stored_position: Position::new(START_X, START_Y), 
+            cursor_position: Position::new(START_X, START_Y), 
             command_state: CommandState::default() 
         }
     }
